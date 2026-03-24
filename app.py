@@ -706,29 +706,79 @@ tab1, tab2 = st.tabs(["Production Charts", "AI Assistant"])
 with tab1:
     st.header("Daily Production Trends")
 
-    st.subheader("Corrugator: Actual vs Planned")
-    corr_df = _prepare_chart_df(df, "Corrugator")
-    st.line_chart(corr_df[["Actual", "Planned"]])
+    process_options = sorted(df["Process"].dropna().unique().tolist())
+    selected_process = st.selectbox("Process", process_options, index=0)
+    metric_view = st.radio(
+        "Chart Type",
+        ["Actual vs Planned", "Stoppages", "Yield vs Rejections"],
+        horizontal=True,
+    )
 
-    st.subheader("Tuber: Actual vs Planned")
-    tuber_df = _prepare_chart_df(df, "Tuber")
-    st.line_chart(tuber_df[["Actual", "Planned"]])
+    min_date = df["Date_Parsed"].min().date()
+    max_date = df["Date_Parsed"].max().date()
+    selected_range = st.date_input(
+        "Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
+    if isinstance(selected_range, tuple) and len(selected_range) == 2:
+        start_date, end_date = selected_range
+    else:
+        start_date = selected_range
+        end_date = selected_range
 
-    st.subheader("Printing: Actual Production (Daily)")
-    printing_actual_df = _prepare_metric_chart_df(df, "Printing", "Actual")
-    st.line_chart(printing_actual_df[["Actual"]])
+    filtered_df = df[
+        (df["Process"] == selected_process)
+        & (df["Date_Parsed"].dt.date >= start_date)
+        & (df["Date_Parsed"].dt.date <= end_date)
+    ].sort_values("Date_Parsed")
 
-    st.subheader("Finishing: Actual Production (Daily)")
-    finishing_actual_df = _prepare_metric_chart_df(df, "Finishing", "Actual")
-    st.line_chart(finishing_actual_df[["Actual"]])
+    if metric_view == "Actual vs Planned":
+        plot_df = filtered_df.set_index("Date_Parsed")[["Actual", "Planned"]]
+        st.line_chart(plot_df, use_container_width=True)
+    elif metric_view == "Stoppages":
+        plot_df = filtered_df.set_index("Date_Parsed")[["Stoppages"]]
+        st.line_chart(plot_df, use_container_width=True)
+    else:
+        plot_df = filtered_df.set_index("Date_Parsed")[["Yield", "Rejections"]]
+        st.line_chart(plot_df, use_container_width=True)
 
-    st.subheader("Printing: Stoppages (Hours)")
-    printing_stop_df = _prepare_metric_chart_df(df, "Printing", "Stoppages")
-    st.line_chart(printing_stop_df[["Stoppages"]])
-
-    st.subheader("Raw Data Table")
-    display_df = df.drop(columns=["Date_Parsed"]).copy()
-    st.dataframe(display_df)
+    with st.expander("View Formatted Raw Data"):
+        table_processes = st.multiselect(
+            "Processes in Table",
+            process_options,
+            default=process_options,
+        )
+        table_df = df[df["Process"].isin(table_processes)].copy()
+        table_df = table_df.sort_values(["Date_Parsed", "Process"])
+        table_df = table_df[
+            [
+                "Date",
+                "Process",
+                "Planned",
+                "Planned_Unit",
+                "Actual",
+                "Actual_Unit",
+                "Yield",
+                "Yield_Unit",
+                "Rejections",
+                "Rejections_Unit",
+                "Stoppages",
+                "Stoppages_Unit",
+                "Efficiency",
+                "Production_Loss",
+            ]
+        ].rename(
+            columns={
+                "Planned_Unit": "Planned Unit",
+                "Actual_Unit": "Actual Unit",
+                "Yield_Unit": "Yield Unit",
+                "Rejections_Unit": "Rejections Unit",
+                "Stoppages_Unit": "Stoppages Unit",
+            }
+        )
+        st.dataframe(table_df, use_container_width=True, hide_index=True)
 
 with tab2:
     st.header("Chat with your Factory Data")
