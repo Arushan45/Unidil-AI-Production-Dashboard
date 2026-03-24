@@ -77,6 +77,39 @@ def _format_date_label(ts):
     return f"{ts.strftime('%b')} {ts.day}"
 
 
+def _extract_unit_from_label(label_text):
+    match = re.search(r"\(([^)]+)\)", str(label_text))
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _build_unit_lookup(clean_df):
+    lookup = {}
+    if clean_df.empty or "Unit" not in clean_df.columns:
+        return lookup
+    unit_df = (
+        clean_df[["Process", "Metric", "Unit"]]
+        .dropna()
+        .drop_duplicates(subset=["Process", "Metric"], keep="last")
+    )
+    for _, row in unit_df.iterrows():
+        lookup[(row["Process"], row["Metric"])] = str(row["Unit"]).strip()
+    return lookup
+
+
+def _metric_unit(row, metric):
+    if metric == "Efficiency":
+        return "%"
+    return str(row.get(f"{metric}_Unit", "") or "").strip()
+
+
+def _format_value_with_unit(value, unit):
+    if unit:
+        return f"{value:.2f} {unit}"
+    return f"{value:.2f}"
+
+
 def _extract_unidil_rows(raw_df):
     first_col = raw_df.iloc[:, 0].astype(str).str.strip().str.upper()
     unidil_rows = first_col[first_col == "UNIDIL"]
@@ -95,14 +128,15 @@ def _extract_unidil_rows(raw_df):
 
 def _parse_production_sheet(raw_df):
     if raw_df.shape[0] < 4:
-        return pd.DataFrame(columns=["Date", "Process", "Metric", "Value"])
+        return pd.DataFrame(columns=["Date", "Process", "Metric", "Value", "Unit"])
 
     date_row = raw_df.iloc[2]
     data = []
     current_section = None
 
     for i in range(3, len(raw_df)):
-        label = str(raw_df.iloc[i, 0]).strip().lower()
+        raw_label = str(raw_df.iloc[i, 0]).strip()
+        label = raw_label.lower()
         if "planned" in label:
             current_section = "Planned"
             continue
@@ -154,6 +188,7 @@ def _parse_production_sheet(raw_df):
                     "Process": process,
                     "Metric": current_section,
                     "Value": numeric_val,
+                    "Unit": _extract_unit_from_label(raw_label),
                 }
             )
 
@@ -165,7 +200,7 @@ def load_and_process_data():
     local_raw_df = pd.read_csv("Daily Production Data_NEW Format - UNIDIL.csv", header=None)
     local_long_df = _parse_production_sheet(local_raw_df)
 
-    google_long_df = pd.DataFrame(columns=["Date", "Process", "Metric", "Value"])
+    google_long_df = pd.DataFrame(columns=["Date", "Process", "Metric", "Value", "Unit"])
     try:
         google_raw_df = pd.read_csv(GOOGLE_SHEET_CSV_URL, header=None)
         unidil_blocks = _extract_unidil_rows(google_raw_df)
@@ -177,6 +212,7 @@ def load_and_process_data():
 
     clean_df = pd.concat([local_long_df, google_long_df], ignore_index=True)
     clean_df = clean_df.drop_duplicates(subset=["Date", "Process", "Metric"], keep="last")
+    unit_lookup = _build_unit_lookup(clean_df)
 
     final_df = clean_df.pivot_table(
         index=["Date", "Process"], columns="Metric", values="Value", aggfunc="first"
@@ -214,6 +250,10 @@ def load_and_process_data():
 
     for col in ["Planned", "Actual", "Yield", "Rejections", "Stoppages"]:
         final_df[col] = final_df[col].fillna(0)
+        final_df[f"{col}_Unit"] = final_df.apply(
+            lambda r: unit_lookup.get((r["Process"], col), ""),
+            axis=1,
+        )
 
     final_df["Date"] = final_df["Date_Parsed"].apply(_format_date_label)
     final_df["Efficiency"] = np.where(
@@ -375,14 +415,16 @@ def _build_reasoning_answer(df, query_text):
 
     if row["Stoppages"] > max(prev_means["Stoppages"] * 1.2, 60):
         clues.append(
-            f"Stoppages were high ({row['Stoppages']:.2f}) vs recent average ({prev_means['Stoppages']:.2f}), "
+            f"Stoppages were high ({_format_value_with_unit(row['Stoppages'], _metric_unit(row, 'Stoppages'))}) "
+            f"vs recent average ({_format_value_with_unit(prev_means['Stoppages'], _metric_unit(row, 'Stoppages'))}), "
             "which likely reduced stable production flow."
         )
         actions.append("Check machine downtime logs and top stoppage reasons for that shift/day.")
 
     if row["Rejections"] > max(prev_means["Rejections"] * 1.2, 50):
         clues.append(
-            f"Rejections were elevated ({row['Rejections']:.2f}) vs recent average ({prev_means['Rejections']:.2f}), "
+            f"Rejections were elevated ({_format_value_with_unit(row['Rejections'], _metric_unit(row, 'Rejections'))}) "
+            f"vs recent average ({_format_value_with_unit(prev_means['Rejections'], _metric_unit(row, 'Rejections'))}), "
             "which can reduce effective yield/output."
         )
         actions.append("Review defect categories, material lot quality, and setup/changeover parameters.")
@@ -390,7 +432,9 @@ def _build_reasoning_answer(df, query_text):
     if row["Actual"] < row["Planned"]:
         loss = row["Planned"] - row["Actual"]
         clues.append(
-            f"Actual was below planned by {loss:.2f} ({row['Actual']:.2f} vs {row['Planned']:.2f}), "
+            f"Actual was below planned by {_format_value_with_unit(loss, _metric_unit(row, 'Actual'))} "
+            f"({_format_value_with_unit(row['Actual'], _metric_unit(row, 'Actual'))} vs "
+            f"{_format_value_with_unit(row['Planned'], _metric_unit(row, 'Planned'))}), "
             "indicating execution shortfall on that day."
         )
         actions.append("Validate manpower, speed losses, and micro-stops during peak planned hours.")
@@ -398,8 +442,9 @@ def _build_reasoning_answer(df, query_text):
     if row["Yield"] < prev_means["Yield"]:
         drop = prev_means["Yield"] - row["Yield"]
         clues.append(
-            f"Yield was lower than recent trend by {drop:.2f} points "
-            f"({row['Yield']:.2f} vs {prev_means['Yield']:.2f})."
+            f"Yield was lower than recent trend by {_format_value_with_unit(drop, _metric_unit(row, 'Yield'))} "
+            f"({_format_value_with_unit(row['Yield'], _metric_unit(row, 'Yield'))} vs "
+            f"{_format_value_with_unit(prev_means['Yield'], _metric_unit(row, 'Yield'))})."
         )
         actions.append("Audit process settings around that date and compare with the previous 3-5 days.")
 
@@ -409,7 +454,10 @@ def _build_reasoning_answer(df, query_text):
 
     metric_line = ""
     if q_metric and q_metric in row.index:
-        metric_line = f"{process} {q_metric} on {date_label}: {row[q_metric]:.2f}\n\n"
+        metric_line = (
+            f"{process} {q_metric} on {date_label}: "
+            f"{_format_value_with_unit(row[q_metric], _metric_unit(row, q_metric))}\n\n"
+        )
 
     return (
         f"{metric_line}Likely reasons for {process} on {date_label}:\n"
@@ -427,17 +475,26 @@ def _build_factory_ops_answer(df, query_text):
 
     if "highest stoppage" in text or "max stoppage" in text:
         row = scoped.loc[scoped["Stoppages"].idxmax()]
-        return f"Highest stoppage: {row['Process']} on {row['Date']} = {row['Stoppages']:.2f}"
+        return (
+            f"Highest stoppage: {row['Process']} on {row['Date']} = "
+            f"{_format_value_with_unit(row['Stoppages'], _metric_unit(row, 'Stoppages'))}"
+        )
 
     if "lowest yield" in text or "worst yield" in text:
         non_zero = scoped[scoped["Yield"] > 0]
         if not non_zero.empty:
             row = non_zero.loc[non_zero["Yield"].idxmin()]
-            return f"Lowest yield: {row['Process']} on {row['Date']} = {row['Yield']:.2f}"
+            return (
+                f"Lowest yield: {row['Process']} on {row['Date']} = "
+                f"{_format_value_with_unit(row['Yield'], _metric_unit(row, 'Yield'))}"
+            )
 
     if "best day" in text and ("actual" in text or "production" in text):
         row = scoped.loc[scoped["Actual"].idxmax()]
-        return f"Best actual production day: {row['Process']} on {row['Date']} = {row['Actual']:.2f}"
+        return (
+            f"Best actual production day: {row['Process']} on {row['Date']} = "
+            f"{_format_value_with_unit(row['Actual'], _metric_unit(row, 'Actual'))}"
+        )
 
     if "summary" in text:
         month_date = _extract_query_date(query_text)
@@ -450,9 +507,13 @@ def _build_factory_ops_answer(df, query_text):
         lines = []
         for _, r in grouped.iterrows():
             eff = (r["Actual"] / r["Planned"] * 100) if r["Planned"] > 0 else 0
+            sample = summary_df[summary_df["Process"] == r["Process"]].iloc[0]
             lines.append(
-                f"{r['Process']}: Planned {r['Planned']:.2f}, Actual {r['Actual']:.2f}, "
-                f"Efficiency {eff:.2f}%, Stoppages {r['Stoppages']:.2f}, Rejections {r['Rejections']:.2f}"
+                f"{r['Process']}: Planned {_format_value_with_unit(r['Planned'], _metric_unit(sample, 'Planned'))}, "
+                f"Actual {_format_value_with_unit(r['Actual'], _metric_unit(sample, 'Actual'))}, "
+                f"Efficiency {_format_value_with_unit(eff, _metric_unit(sample, 'Efficiency'))}, "
+                f"Stoppages {_format_value_with_unit(r['Stoppages'], _metric_unit(sample, 'Stoppages'))}, "
+                f"Rejections {_format_value_with_unit(r['Rejections'], _metric_unit(sample, 'Rejections'))}"
             )
         return "Factory summary:\n" + "\n".join([f"- {x}" for x in lines])
 
@@ -490,13 +551,19 @@ def _direct_data_answer(df, query_text):
 
     if q_metric and q_metric in row.index:
         value = row[q_metric]
-        return f"{process_label} {q_metric} on {date_label}: {value:.2f}"
+        return (
+            f"{process_label} {q_metric} on {date_label}: "
+            f"{_format_value_with_unit(value, _metric_unit(row, q_metric))}"
+        )
 
     return (
         f"{process_label} on {date_label} -> "
-        f"Planned: {row['Planned']:.2f}, Actual: {row['Actual']:.2f}, "
-        f"Yield: {row['Yield']:.2f}, Rejections: {row['Rejections']:.2f}, "
-        f"Stoppages: {row['Stoppages']:.2f}, Efficiency: {row['Efficiency']:.2f}%"
+        f"Planned: {_format_value_with_unit(row['Planned'], _metric_unit(row, 'Planned'))}, "
+        f"Actual: {_format_value_with_unit(row['Actual'], _metric_unit(row, 'Actual'))}, "
+        f"Yield: {_format_value_with_unit(row['Yield'], _metric_unit(row, 'Yield'))}, "
+        f"Rejections: {_format_value_with_unit(row['Rejections'], _metric_unit(row, 'Rejections'))}, "
+        f"Stoppages: {_format_value_with_unit(row['Stoppages'], _metric_unit(row, 'Stoppages'))}, "
+        f"Efficiency: {_format_value_with_unit(row['Efficiency'], _metric_unit(row, 'Efficiency'))}"
     )
 
 
@@ -522,7 +589,19 @@ def _build_compare_answer(df, query_text):
         return {"text": f"No data available for {_format_date_label(date_a)} and {_format_date_label(date_b)}."}
 
     compare_df = compare_df.sort_values(["Process", "Date_Parsed"])
-    table_df = compare_df[["Date", "Process", "Planned", "Actual", "Efficiency", "Stoppages"]].copy()
+    table_df = compare_df[
+        [
+            "Date",
+            "Process",
+            "Planned",
+            "Planned_Unit",
+            "Actual",
+            "Actual_Unit",
+            "Efficiency",
+            "Stoppages",
+            "Stoppages_Unit",
+        ]
+    ].copy()
     table_df = table_df.round(2)
 
     # Chart view: aggregate by date for clean visualization.
@@ -542,8 +621,10 @@ def _build_compare_answer(df, query_text):
             actual_diff = g.loc[label_b, "Actual"] - g.loc[label_a, "Actual"]
             planned_diff = g.loc[label_b, "Planned"] - g.loc[label_a, "Planned"]
             summary_lines.append(
-                f"{process}: Actual {'up' if actual_diff >= 0 else 'down'} {abs(actual_diff):.2f}, "
-                f"Planned {'up' if planned_diff >= 0 else 'down'} {abs(planned_diff):.2f} "
+                f"{process}: Actual {'up' if actual_diff >= 0 else 'down'} "
+                f"{_format_value_with_unit(abs(actual_diff), _metric_unit(g.loc[label_b], 'Actual'))}, "
+                f"Planned {'up' if planned_diff >= 0 else 'down'} "
+                f"{_format_value_with_unit(abs(planned_diff), _metric_unit(g.loc[label_b], 'Planned'))} "
                 f"from {label_a} to {label_b}."
             )
 
