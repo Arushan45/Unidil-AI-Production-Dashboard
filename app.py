@@ -218,6 +218,30 @@ def _prepare_chart_df(df, process_name):
     return chart_df.set_index("Date_Parsed")[["Actual", "Planned"]]
 
 
+def _select_working_model(system_prompt):
+    # Prefer newer models, but gracefully fallback based on account availability.
+    preferred_models = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+    ]
+    try:
+        available = set()
+        for model in genai.list_models():
+            methods = getattr(model, "supported_generation_methods", []) or []
+            if "generateContent" in methods:
+                available.add(model.name.replace("models/", ""))
+        for model_name in preferred_models:
+            if model_name in available:
+                return genai.GenerativeModel(model_name, system_instruction=system_prompt), model_name
+    except Exception:
+        pass
+
+    # Final fallback if listing models is unavailable.
+    fallback_name = preferred_models[0]
+    return genai.GenerativeModel(fallback_name, system_instruction=system_prompt), fallback_name
+
+
 df = load_and_process_data()
 insights = generate_insights(df)
 
@@ -256,18 +280,11 @@ with tab2:
         Recent Issues:
         {context_insights}
         """
-        # Use a stable model name for google-generativeai SDK on Streamlit Cloud.
-        model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=system_prompt)
+        model, model_name = _select_working_model(system_prompt)
+        st.caption(f"AI model: {model_name}")
 
         if "messages" not in st.session_state:
             st.session_state.messages = []
-        if "chat_session" not in st.session_state:
-            st.session_state.chat_session = model.start_chat(history=[])
-            st.session_state.chat_system_prompt = system_prompt
-        elif st.session_state.get("chat_system_prompt") != system_prompt:
-            # Rebuild the chat when the system context changes.
-            st.session_state.chat_session = model.start_chat(history=[])
-            st.session_state.chat_system_prompt = system_prompt
 
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
@@ -281,17 +298,23 @@ with tab2:
             with st.chat_message("assistant"):
                 response_text = None
                 try:
-                    response = st.session_state.chat_session.send_message(prompt)
+                    # Build lightweight conversation context without chat-session state mutations.
+                    recent_messages = st.session_state.messages[-8:]
+                    conversation = "\n".join(
+                        [f"{m['role'].upper()}: {m['content']}" for m in recent_messages]
+                    )
+                    full_prompt = (
+                        "Use the factory dataset context from the system instruction.\n"
+                        "Answer clearly and concisely.\n\n"
+                        f"Conversation so far:\n{conversation}\n\n"
+                        f"Latest user question:\n{prompt}"
+                    )
+                    response = model.generate_content(full_prompt)
                     response_text = response.text
-                except Exception:
-                    # Fallback to single-shot generation if chat session payload is rejected.
-                    try:
-                        fallback = model.generate_content(prompt)
-                        response_text = fallback.text
-                        # Reset chat after fallback to avoid repeated invalid session state.
-                        st.session_state.chat_session = model.start_chat(history=[])
-                    except Exception:
-                        st.error("AI assistant is temporarily unavailable. Please try again in a few seconds.")
+                except Exception as e:
+                    st.error("AI assistant request failed. Please check your API key/project access and try again.")
+                    with st.expander("Error details"):
+                        st.code(str(e))
 
                 if response_text:
                     st.markdown(response_text)
