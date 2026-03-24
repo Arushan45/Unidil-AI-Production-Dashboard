@@ -161,6 +161,10 @@ def _parse_production_sheet(raw_df):
             process = "Corrugator"
         elif "tuber" in label:
             process = "Tuber"
+        elif "printing" in label or "printer" in label:
+            process = "Printing"
+        elif "finishing" in label:
+            process = "Finishing"
 
         if not process:
             continue
@@ -285,6 +289,14 @@ def _prepare_chart_df(df, process_name):
     return chart_df.set_index("Date_Parsed")[["Actual", "Planned"]]
 
 
+def _prepare_metric_chart_df(df, process_name, metric):
+    chart_df = df[df["Process"] == process_name].copy()
+    chart_df = chart_df.dropna(subset=["Date_Parsed"]).sort_values("Date_Parsed")
+    chart_df = chart_df[chart_df[metric] > 0]
+    chart_df = chart_df.drop_duplicates(subset=["Date_Parsed"], keep="last")
+    return chart_df.set_index("Date_Parsed")[[metric]]
+
+
 def _extract_query_date(query_text):
     text = query_text.lower()
 
@@ -341,6 +353,10 @@ def _extract_query_process(query_text):
         return "Tuber"
     if "corrugator" in text:
         return "Corrugator"
+    if "printing" in text or "printer" in text:
+        return "Printing"
+    if "finishing" in text:
+        return "Finishing"
     return None
 
 
@@ -698,6 +714,18 @@ with tab1:
     tuber_df = _prepare_chart_df(df, "Tuber")
     st.line_chart(tuber_df[["Actual", "Planned"]])
 
+    st.subheader("Printing: Actual Production (Daily)")
+    printing_actual_df = _prepare_metric_chart_df(df, "Printing", "Actual")
+    st.line_chart(printing_actual_df[["Actual"]])
+
+    st.subheader("Finishing: Actual Production (Daily)")
+    finishing_actual_df = _prepare_metric_chart_df(df, "Finishing", "Actual")
+    st.line_chart(finishing_actual_df[["Actual"]])
+
+    st.subheader("Printing: Stoppages (Hours)")
+    printing_stop_df = _prepare_metric_chart_df(df, "Printing", "Stoppages")
+    st.line_chart(printing_stop_df[["Stoppages"]])
+
     st.subheader("Raw Data Table")
     display_df = df.drop(columns=["Date_Parsed"]).copy()
     st.dataframe(display_df)
@@ -734,7 +762,7 @@ with tab2:
                     chart_df = pd.DataFrame(message["chart_records"]).set_index("Date")
                     st.bar_chart(chart_df[["Actual", "Planned"]], use_container_width=True)
 
-        if prompt := st.chat_input("Ask about Corrugator efficiency, recent downtime, or yield..."):
+        if prompt := st.chat_input("Ask about Corrugator/Tuber/Printing/Finishing, downtime, yield, or comparisons..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
