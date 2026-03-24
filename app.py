@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime
 
 import google.generativeai as genai
@@ -218,6 +219,138 @@ def _prepare_chart_df(df, process_name):
     return chart_df.set_index("Date_Parsed")[["Actual", "Planned"]]
 
 
+def _extract_query_date(query_text):
+    text = query_text.lower()
+    month_map = {
+        "jan": 1,
+        "january": 1,
+        "feb": 2,
+        "february": 2,
+        "mar": 3,
+        "march": 3,
+        "apr": 4,
+        "april": 4,
+        "may": 5,
+        "jun": 6,
+        "june": 6,
+        "jul": 7,
+        "july": 7,
+        "aug": 8,
+        "august": 8,
+        "sep": 9,
+        "sept": 9,
+        "september": 9,
+        "oct": 10,
+        "october": 10,
+        "nov": 11,
+        "november": 11,
+        "dec": 12,
+        "december": 12,
+    }
+
+    # Handles: jan21, jan 21, january 21
+    match = re.search(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*([0-9]{1,2})\b",
+        text,
+    )
+    if not match:
+        return None
+
+    month_token = match.group(1)
+    day = int(match.group(2))
+    month = month_map.get(month_token, month_map.get(month_token[:3]))
+    if not month:
+        return None
+
+    year = datetime.now().year
+    try:
+        return pd.Timestamp(year=year, month=month, day=day)
+    except ValueError:
+        return None
+
+
+def _extract_query_process(query_text):
+    text = query_text.lower()
+    if "tuber" in text:
+        return "Tuber"
+    if "corrugator" in text:
+        return "Corrugator"
+    return None
+
+
+def _extract_query_metric(query_text):
+    text = query_text.lower()
+    if any(k in text for k in ["downtime", "stoppage", "stoppages"]):
+        return "Stoppages"
+    if "rejection" in text:
+        return "Rejections"
+    if "yield" in text:
+        return "Yield"
+    if "actual" in text:
+        return "Actual"
+    if "planned" in text or "plan" in text:
+        return "Planned"
+    if "efficiency" in text:
+        return "Efficiency"
+    return None
+
+
+def _direct_data_answer(df, query_text):
+    q_date = _extract_query_date(query_text)
+    q_process = _extract_query_process(query_text)
+    q_metric = _extract_query_metric(query_text)
+
+    if q_date is None:
+        return None
+
+    filtered = df.copy()
+    filtered = filtered[
+        (filtered["Date_Parsed"].dt.month == q_date.month)
+        & (filtered["Date_Parsed"].dt.day == q_date.day)
+    ]
+    if q_process:
+        filtered = filtered[filtered["Process"] == q_process]
+
+    if filtered.empty:
+        date_label = _format_date_label(q_date)
+        if q_process:
+            return f"No {q_process} data found for {date_label}."
+        return f"No data found for {date_label}."
+
+    row = filtered.iloc[0]
+    date_label = row["Date"]
+    process_label = row["Process"]
+
+    if q_metric and q_metric in row.index:
+        value = row[q_metric]
+        return f"{process_label} {q_metric} on {date_label}: {value:.2f}"
+
+    return (
+        f"{process_label} on {date_label} -> "
+        f"Planned: {row['Planned']:.2f}, Actual: {row['Actual']:.2f}, "
+        f"Yield: {row['Yield']:.2f}, Rejections: {row['Rejections']:.2f}, "
+        f"Stoppages: {row['Stoppages']:.2f}, Efficiency: {row['Efficiency']:.2f}%"
+    )
+
+
+def _build_context_for_query(df, query_text):
+    q_date = _extract_query_date(query_text)
+    q_process = _extract_query_process(query_text)
+
+    context_df = df.copy()
+    if q_process:
+        context_df = context_df[context_df["Process"] == q_process]
+    if q_date is not None:
+        context_df = context_df[
+            (context_df["Date_Parsed"].dt.month == q_date.month)
+            | (context_df["Date_Parsed"].dt.month == q_date.month - 1)
+            | (context_df["Date_Parsed"].dt.month == q_date.month + 1)
+        ]
+    if context_df.empty:
+        context_df = df.tail(60)
+    return context_df.drop(columns=["Date_Parsed"])
+
+
 def _select_working_model(system_prompt):
     # Prefer newer models, but gracefully fallback based on account availability.
     preferred_models = [
@@ -297,24 +430,33 @@ with tab2:
 
             with st.chat_message("assistant"):
                 response_text = None
-                try:
-                    # Build lightweight conversation context without chat-session state mutations.
-                    recent_messages = st.session_state.messages[-8:]
-                    conversation = "\n".join(
-                        [f"{m['role'].upper()}: {m['content']}" for m in recent_messages]
-                    )
-                    full_prompt = (
-                        "Use the factory dataset context from the system instruction.\n"
-                        "Answer clearly and concisely.\n\n"
-                        f"Conversation so far:\n{conversation}\n\n"
-                        f"Latest user question:\n{prompt}"
-                    )
-                    response = model.generate_content(full_prompt)
-                    response_text = response.text
-                except Exception as e:
-                    st.error("AI assistant request failed. Please check your API key/project access and try again.")
-                    with st.expander("Error details"):
-                        st.code(str(e))
+
+                # First: deterministic data answer for date/process/metric queries.
+                response_text = _direct_data_answer(df, prompt)
+
+                # Second: model answer with relevant context for broader questions.
+                if not response_text:
+                    try:
+                        context_df = _build_context_for_query(df, prompt)
+                        context_data = context_df.to_markdown(index=False)
+
+                        recent_messages = st.session_state.messages[-8:]
+                        conversation = "\n".join(
+                            [f"{m['role'].upper()}: {m['content']}" for m in recent_messages]
+                        )
+                        full_prompt = (
+                            "Use the factory dataset context below and do not claim missing data if it is present.\n"
+                            "If user asks for a specific date/process value, answer with exact numbers.\n\n"
+                            f"Dataset context:\n{context_data}\n\n"
+                            f"Conversation so far:\n{conversation}\n\n"
+                            f"Latest user question:\n{prompt}"
+                        )
+                        response = model.generate_content(full_prompt)
+                        response_text = response.text
+                    except Exception as e:
+                        st.error("AI assistant request failed. Please check your API key/project access and try again.")
+                        with st.expander("Error details"):
+                            st.code(str(e))
 
                 if response_text:
                     st.markdown(response_text)
