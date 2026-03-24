@@ -5,6 +5,7 @@ import google.generativeai as genai
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Unidil AI Production Dashboard", layout="wide")
@@ -20,8 +21,11 @@ GOOGLE_SHEET_CSV_URL = (
 
 def _get_gemini_api_key():
     # Streamlit Cloud recommended secret source.
-    if "GOOGLE_API_KEY" in st.secrets:
-        return st.secrets["GOOGLE_API_KEY"]
+    try:
+        if "GOOGLE_API_KEY" in st.secrets:
+            return st.secrets["GOOGLE_API_KEY"]
+    except StreamlitSecretNotFoundError:
+        pass
     # Local fallback.
     return os.environ.get("GOOGLE_API_KEY")
 
