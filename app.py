@@ -243,7 +243,7 @@ with tab2:
     st.header("Chat with your Factory Data")
     api_key = _get_gemini_api_key()
     if not api_key:
-        st.error("Google Gemini API Key is not set. Add GOOGLE_API_KEY in Streamlit Secrets.")
+        st.error("Gemini API key is not set. Add GEMINI_API_KEY (or GOOGLE_API_KEY) in Streamlit Secrets.")
     else:
         genai.configure(api_key=api_key)
         context_data = df.tail(20).drop(columns=["Date_Parsed"]).to_markdown(index=False)
@@ -256,10 +256,18 @@ with tab2:
         Recent Issues:
         {context_insights}
         """
-        model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=system_prompt)
+        # Use a stable model name for google-generativeai SDK on Streamlit Cloud.
+        model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=system_prompt)
 
         if "messages" not in st.session_state:
             st.session_state.messages = []
+        if "chat_session" not in st.session_state:
+            st.session_state.chat_session = model.start_chat(history=[])
+            st.session_state.chat_system_prompt = system_prompt
+        elif st.session_state.get("chat_system_prompt") != system_prompt:
+            # Rebuild the chat when the system context changes.
+            st.session_state.chat_session = model.start_chat(history=[])
+            st.session_state.chat_system_prompt = system_prompt
 
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
@@ -271,13 +279,20 @@ with tab2:
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
-                chat = model.start_chat(history=[])
+                response_text = None
+                try:
+                    response = st.session_state.chat_session.send_message(prompt)
+                    response_text = response.text
+                except Exception:
+                    # Fallback to single-shot generation if chat session payload is rejected.
+                    try:
+                        fallback = model.generate_content(prompt)
+                        response_text = fallback.text
+                        # Reset chat after fallback to avoid repeated invalid session state.
+                        st.session_state.chat_session = model.start_chat(history=[])
+                    except Exception:
+                        st.error("AI assistant is temporarily unavailable. Please try again in a few seconds.")
 
-                for msg in st.session_state.messages[:-1]:
-                    role = "user" if msg["role"] == "user" else "model"
-                    chat.history.append({"role": role, "parts": [msg["content"]]})
-
-                response = chat.send_message(prompt)
-                st.markdown(response.text)
-
-            st.session_state.messages.append({"role": "assistant", "content": response.text})
+                if response_text:
+                    st.markdown(response_text)
+                    st.session_state.messages.append({"role": "assistant", "content": response_text})
