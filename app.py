@@ -18,6 +18,32 @@ GOOGLE_SHEET_GID = "428263152"
 GOOGLE_SHEET_CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={GOOGLE_SHEET_GID}"
 )
+MONTH_MAP = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
 
 
 def _get_gemini_api_key():
@@ -221,32 +247,6 @@ def _prepare_chart_df(df, process_name):
 
 def _extract_query_date(query_text):
     text = query_text.lower()
-    month_map = {
-        "jan": 1,
-        "january": 1,
-        "feb": 2,
-        "february": 2,
-        "mar": 3,
-        "march": 3,
-        "apr": 4,
-        "april": 4,
-        "may": 5,
-        "jun": 6,
-        "june": 6,
-        "jul": 7,
-        "july": 7,
-        "aug": 8,
-        "august": 8,
-        "sep": 9,
-        "sept": 9,
-        "september": 9,
-        "oct": 10,
-        "october": 10,
-        "nov": 11,
-        "november": 11,
-        "dec": 12,
-        "december": 12,
-    }
 
     # Handles: jan21, jan 21, january 21
     match = re.search(
@@ -258,7 +258,7 @@ def _extract_query_date(query_text):
 
     month_token = match.group(1)
     day = int(match.group(2))
-    month = month_map.get(month_token, month_map.get(month_token[:3]))
+    month = MONTH_MAP.get(month_token, MONTH_MAP.get(month_token[:3]))
     if not month:
         return None
 
@@ -267,6 +267,32 @@ def _extract_query_date(query_text):
         return pd.Timestamp(year=year, month=month, day=day)
     except ValueError:
         return None
+
+
+def _extract_query_dates(query_text):
+    text = query_text.lower()
+    matches = re.finditer(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*([0-9]{1,2})\b",
+        text,
+    )
+    dates = []
+    seen = set()
+    year = datetime.now().year
+    for match in matches:
+        month_token = match.group(1)
+        day = int(match.group(2))
+        month = MONTH_MAP.get(month_token, MONTH_MAP.get(month_token[:3]))
+        if not month:
+            continue
+        try:
+            ts = pd.Timestamp(year=year, month=month, day=day)
+        except ValueError:
+            continue
+        key = (ts.month, ts.day)
+        if key not in seen:
+            dates.append(ts)
+            seen.add(key)
+    return dates
 
 
 def _extract_query_process(query_text):
@@ -331,6 +357,64 @@ def _direct_data_answer(df, query_text):
         f"Yield: {row['Yield']:.2f}, Rejections: {row['Rejections']:.2f}, "
         f"Stoppages: {row['Stoppages']:.2f}, Efficiency: {row['Efficiency']:.2f}%"
     )
+
+
+def _build_compare_answer(df, query_text):
+    text = query_text.lower()
+    dates = _extract_query_dates(query_text)
+    if len(dates) < 2:
+        return None
+    if not any(k in text for k in ["compare", "vs", "difference", "diff"]):
+        return None
+
+    date_a, date_b = dates[0], dates[1]
+    q_process = _extract_query_process(query_text)
+
+    compare_df = df[
+        ((df["Date_Parsed"].dt.month == date_a.month) & (df["Date_Parsed"].dt.day == date_a.day))
+        | ((df["Date_Parsed"].dt.month == date_b.month) & (df["Date_Parsed"].dt.day == date_b.day))
+    ].copy()
+    if q_process:
+        compare_df = compare_df[compare_df["Process"] == q_process]
+
+    if compare_df.empty:
+        return {"text": f"No data available for {_format_date_label(date_a)} and {_format_date_label(date_b)}."}
+
+    compare_df = compare_df.sort_values(["Process", "Date_Parsed"])
+    table_df = compare_df[["Date", "Process", "Planned", "Actual", "Efficiency", "Stoppages"]].copy()
+    table_df = table_df.round(2)
+
+    # Chart view: aggregate by date for clean visualization.
+    chart_df = (
+        compare_df.groupby("Date", as_index=False)[["Actual", "Planned"]]
+        .sum()
+        .set_index("Date")
+        .loc[[_format_date_label(date_a), _format_date_label(date_b)]]
+    )
+
+    summary_lines = []
+    for process, group in compare_df.groupby("Process"):
+        g = group.set_index("Date")
+        label_a = _format_date_label(date_a)
+        label_b = _format_date_label(date_b)
+        if label_a in g.index and label_b in g.index:
+            actual_diff = g.loc[label_b, "Actual"] - g.loc[label_a, "Actual"]
+            planned_diff = g.loc[label_b, "Planned"] - g.loc[label_a, "Planned"]
+            summary_lines.append(
+                f"{process}: Actual {'up' if actual_diff >= 0 else 'down'} {abs(actual_diff):.2f}, "
+                f"Planned {'up' if planned_diff >= 0 else 'down'} {abs(planned_diff):.2f} "
+                f"from {label_a} to {label_b}."
+            )
+
+    title = f"Comparison: {_format_date_label(date_a)} vs {_format_date_label(date_b)}"
+    summary_text = "\n".join(summary_lines) if summary_lines else "Comparison generated."
+    response_text = f"**{title}**\n\n{summary_text}"
+
+    return {
+        "text": response_text,
+        "table_records": table_df.to_dict(orient="records"),
+        "chart_records": chart_df.reset_index().to_dict(orient="records"),
+    }
 
 
 def _build_context_for_query(df, query_text):
@@ -422,6 +506,11 @@ with tab2:
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
+                if message.get("table_records"):
+                    st.dataframe(pd.DataFrame(message["table_records"]), use_container_width=True)
+                if message.get("chart_records"):
+                    chart_df = pd.DataFrame(message["chart_records"]).set_index("Date")
+                    st.bar_chart(chart_df[["Actual", "Planned"]], use_container_width=True)
 
         if prompt := st.chat_input("Ask about Corrugator efficiency, recent downtime, or yield..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
@@ -430,11 +519,23 @@ with tab2:
 
             with st.chat_message("assistant"):
                 response_text = None
+                response_payload = None
 
-                # First: deterministic data answer for date/process/metric queries.
-                response_text = _direct_data_answer(df, prompt)
+                # First: deterministic compare answer for 2-date comparison questions.
+                response_payload = _build_compare_answer(df, prompt)
+                if response_payload:
+                    response_text = response_payload["text"]
+                    if response_payload.get("table_records"):
+                        st.dataframe(pd.DataFrame(response_payload["table_records"]), use_container_width=True)
+                    if response_payload.get("chart_records"):
+                        chart_df = pd.DataFrame(response_payload["chart_records"]).set_index("Date")
+                        st.bar_chart(chart_df[["Actual", "Planned"]], use_container_width=True)
 
-                # Second: model answer with relevant context for broader questions.
+                # Second: deterministic single-date answer.
+                if not response_text:
+                    response_text = _direct_data_answer(df, prompt)
+
+                # Third: model answer with relevant context for broader questions.
                 if not response_text:
                     try:
                         context_df = _build_context_for_query(df, prompt)
@@ -460,4 +561,14 @@ with tab2:
 
                 if response_text:
                     st.markdown(response_text)
-                    st.session_state.messages.append({"role": "assistant", "content": response_text})
+                    if response_payload:
+                        st.session_state.messages.append(
+                            {
+                                "role": "assistant",
+                                "content": response_text,
+                                "table_records": response_payload.get("table_records"),
+                                "chart_records": response_payload.get("chart_records"),
+                            }
+                        )
+                    else:
+                        st.session_state.messages.append({"role": "assistant", "content": response_text})
