@@ -26,8 +26,8 @@ python -m streamlit run app.py
 ```
 
 The app reads key from:
-1. `st.secrets["GOOGLE_API_KEY"]` (Streamlit Cloud)
-2. `GOOGLE_API_KEY` env var (local fallback)
+1. `st.secrets["GEMINI_API_KEY"]` or `st.secrets["GOOGLE_API_KEY"]` (Streamlit Cloud)
+2. `GEMINI_API_KEY` or `GOOGLE_API_KEY` env var (local fallback)
 
 ## 3. Deploy to Streamlit Cloud
 
@@ -37,7 +37,7 @@ The app reads key from:
 4. In app `Settings` -> `Secrets`, add:
 
 ```toml
-GOOGLE_API_KEY = "your_gemini_api_key"
+GEMINI_API_KEY = "your_gemini_api_key"
 ```
 
 5. Save and redeploy.

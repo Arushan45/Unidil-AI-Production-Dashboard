@@ -20,13 +20,17 @@ GOOGLE_SHEET_CSV_URL = (
 
 
 def _get_gemini_api_key():
-    # Streamlit Cloud recommended secret source.
+    # Streamlit Cloud secrets (support both key names).
     try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
         if "GOOGLE_API_KEY" in st.secrets:
             return st.secrets["GOOGLE_API_KEY"]
     except StreamlitSecretNotFoundError:
         pass
-    # Local fallback.
+    # Local env fallbacks.
+    if os.environ.get("GEMINI_API_KEY"):
+        return os.environ.get("GEMINI_API_KEY")
     return os.environ.get("GOOGLE_API_KEY")
 
 
