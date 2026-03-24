@@ -741,8 +741,13 @@ with tab1:
         plot_df = filtered_df.set_index("Date_Parsed")[["Stoppages"]]
         st.line_chart(plot_df, use_container_width=True)
     else:
-        plot_df = filtered_df.set_index("Date_Parsed")[["Yield", "Rejections"]]
-        st.line_chart(plot_df, use_container_width=True)
+        st.subheader(f"{selected_process}: Yield")
+        yield_df = filtered_df.set_index("Date_Parsed")[["Yield"]]
+        st.line_chart(yield_df, use_container_width=True)
+
+        st.subheader(f"{selected_process}: Rejections")
+        reject_df = filtered_df.set_index("Date_Parsed")[["Rejections"]]
+        st.line_chart(reject_df, use_container_width=True)
 
     with st.expander("View Formatted Raw Data"):
         table_processes = st.multiselect(
