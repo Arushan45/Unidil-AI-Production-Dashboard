@@ -321,7 +321,148 @@ def _extract_query_metric(query_text):
     return None
 
 
+def _is_reasoning_query(query_text):
+    text = query_text.lower()
+    reasoning_keywords = [
+        "why",
+        "reason",
+        "cause",
+        "root cause",
+        "what happened",
+        "issue",
+        "problem",
+        "improve",
+        "how to reduce",
+    ]
+    return any(k in text for k in reasoning_keywords)
+
+
+def _build_reasoning_answer(df, query_text):
+    if not _is_reasoning_query(query_text):
+        return None
+
+    q_date = _extract_query_date(query_text)
+    q_process = _extract_query_process(query_text)
+    q_metric = _extract_query_metric(query_text)
+
+    if q_date is None:
+        return None
+
+    scoped = df.copy()
+    if q_process:
+        scoped = scoped[scoped["Process"] == q_process]
+    scoped = scoped.sort_values("Date_Parsed")
+
+    row_df = scoped[
+        (scoped["Date_Parsed"].dt.month == q_date.month)
+        & (scoped["Date_Parsed"].dt.day == q_date.day)
+    ]
+    if row_df.empty:
+        return None
+
+    row = row_df.iloc[0]
+    process = row["Process"]
+    date_label = row["Date"]
+
+    prev_window = scoped[scoped["Date_Parsed"] < row["Date_Parsed"]].tail(5)
+    if prev_window.empty:
+        prev_window = scoped.head(5)
+
+    prev_means = prev_window[["Yield", "Rejections", "Stoppages", "Actual", "Planned", "Efficiency"]].mean()
+
+    clues = []
+    actions = []
+
+    if row["Stoppages"] > max(prev_means["Stoppages"] * 1.2, 60):
+        clues.append(
+            f"Stoppages were high ({row['Stoppages']:.2f}) vs recent average ({prev_means['Stoppages']:.2f}), "
+            "which likely reduced stable production flow."
+        )
+        actions.append("Check machine downtime logs and top stoppage reasons for that shift/day.")
+
+    if row["Rejections"] > max(prev_means["Rejections"] * 1.2, 50):
+        clues.append(
+            f"Rejections were elevated ({row['Rejections']:.2f}) vs recent average ({prev_means['Rejections']:.2f}), "
+            "which can reduce effective yield/output."
+        )
+        actions.append("Review defect categories, material lot quality, and setup/changeover parameters.")
+
+    if row["Actual"] < row["Planned"]:
+        loss = row["Planned"] - row["Actual"]
+        clues.append(
+            f"Actual was below planned by {loss:.2f} ({row['Actual']:.2f} vs {row['Planned']:.2f}), "
+            "indicating execution shortfall on that day."
+        )
+        actions.append("Validate manpower, speed losses, and micro-stops during peak planned hours.")
+
+    if row["Yield"] < prev_means["Yield"]:
+        drop = prev_means["Yield"] - row["Yield"]
+        clues.append(
+            f"Yield was lower than recent trend by {drop:.2f} points "
+            f"({row['Yield']:.2f} vs {prev_means['Yield']:.2f})."
+        )
+        actions.append("Audit process settings around that date and compare with the previous 3-5 days.")
+
+    if not clues:
+        clues.append("No strong anomaly signal was detected from stoppages/rejections/plan gap on that date.")
+        actions.append("Check shift notes and maintenance remarks for non-quantified events.")
+
+    metric_line = ""
+    if q_metric and q_metric in row.index:
+        metric_line = f"{process} {q_metric} on {date_label}: {row[q_metric]:.2f}\n\n"
+
+    return (
+        f"{metric_line}Likely reasons for {process} on {date_label}:\n"
+        + "\n".join([f"- {c}" for c in clues])
+        + "\n\nRecommended checks/actions:\n"
+        + "\n".join([f"- {a}" for a in actions[:3]])
+    )
+
+
+def _build_factory_ops_answer(df, query_text):
+    text = query_text.lower()
+    q_process = _extract_query_process(query_text)
+    scoped = df[df["Process"] == q_process].copy() if q_process else df.copy()
+    scoped = scoped.sort_values("Date_Parsed")
+
+    if "highest stoppage" in text or "max stoppage" in text:
+        row = scoped.loc[scoped["Stoppages"].idxmax()]
+        return f"Highest stoppage: {row['Process']} on {row['Date']} = {row['Stoppages']:.2f}"
+
+    if "lowest yield" in text or "worst yield" in text:
+        non_zero = scoped[scoped["Yield"] > 0]
+        if not non_zero.empty:
+            row = non_zero.loc[non_zero["Yield"].idxmin()]
+            return f"Lowest yield: {row['Process']} on {row['Date']} = {row['Yield']:.2f}"
+
+    if "best day" in text and ("actual" in text or "production" in text):
+        row = scoped.loc[scoped["Actual"].idxmax()]
+        return f"Best actual production day: {row['Process']} on {row['Date']} = {row['Actual']:.2f}"
+
+    if "summary" in text:
+        month_date = _extract_query_date(query_text)
+        summary_df = scoped
+        if month_date is not None:
+            summary_df = summary_df[summary_df["Date_Parsed"].dt.month == month_date.month]
+        grouped = summary_df.groupby("Process", as_index=False)[["Planned", "Actual", "Stoppages", "Rejections"]].sum()
+        if grouped.empty:
+            return None
+        lines = []
+        for _, r in grouped.iterrows():
+            eff = (r["Actual"] / r["Planned"] * 100) if r["Planned"] > 0 else 0
+            lines.append(
+                f"{r['Process']}: Planned {r['Planned']:.2f}, Actual {r['Actual']:.2f}, "
+                f"Efficiency {eff:.2f}%, Stoppages {r['Stoppages']:.2f}, Rejections {r['Rejections']:.2f}"
+            )
+        return "Factory summary:\n" + "\n".join([f"- {x}" for x in lines])
+
+    return None
+
+
 def _direct_data_answer(df, query_text):
+    if _is_reasoning_query(query_text):
+        return None
+
     q_date = _extract_query_date(query_text)
     q_process = _extract_query_process(query_text)
     q_metric = _extract_query_metric(query_text)
@@ -533,9 +674,17 @@ with tab2:
 
                 # Second: deterministic single-date answer.
                 if not response_text:
+                    response_text = _build_reasoning_answer(df, prompt)
+
+                # Third: common factory-ops questions (best/worst/summary).
+                if not response_text:
+                    response_text = _build_factory_ops_answer(df, prompt)
+
+                # Fourth: deterministic single-date answer.
+                if not response_text:
                     response_text = _direct_data_answer(df, prompt)
 
-                # Third: model answer with relevant context for broader questions.
+                # Fifth: model answer with relevant context for broader questions.
                 if not response_text:
                     try:
                         context_df = _build_context_for_query(df, prompt)
